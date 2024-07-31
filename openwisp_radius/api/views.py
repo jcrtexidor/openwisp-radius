@@ -37,7 +37,8 @@ from rest_framework.permissions import (
     IsAuthenticated,
 )
 from rest_framework.response import Response
-from rest_framework.throttling import BaseThrottle  # get_ident method
+from rest_framework.throttling import BaseThrottle
+import twilio.rest
 
 from openwisp_radius.api.serializers import RadiusUserSerializer
 from openwisp_users.api.authentication import BearerAuthentication, SesameAuthentication
@@ -66,28 +67,30 @@ from .serializers import (
 from .swagger import ObtainTokenRequest, ObtainTokenResponse, RegisterResponse
 from .utils import ErrorDictMixin, IDVerificationHelper
 
+import datetime, requests, json, random, string, base64, twilio
+
 authorize = freeradius_views.authorize
 postauth = freeradius_views.postauth
 accounting = freeradius_views.accounting
 
-_TOKEN_AUTH_FAILED = _('Token authentication failed')
+_TOKEN_AUTH_FAILED = _("Token authentication failed")
 renew_required = app_settings.DISPOSABLE_RADIUS_USER_TOKEN
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
-Organization = swapper.load_model('openwisp_users', 'Organization')
-OrganizationUser = swapper.load_model('openwisp_users', 'OrganizationUser')
-PhoneToken = load_model('PhoneToken')
-RadiusAccounting = load_model('RadiusAccounting')
-RadiusToken = load_model('RadiusToken')
-RadiusBatch = load_model('RadiusBatch')
-RadiusUserGroup = load_model('RadiusUserGroup')
-RadiusGroupCheck = load_model('RadiusGroupCheck')
+Organization = swapper.load_model("openwisp_users", "Organization")
+OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
+PhoneToken = load_model("PhoneToken")
+RadiusAccounting = load_model("RadiusAccounting")
+RadiusToken = load_model("RadiusToken")
+RadiusBatch = load_model("RadiusBatch")
+RadiusUserGroup = load_model("RadiusUserGroup")
+RadiusGroupCheck = load_model("RadiusGroupCheck")
 auth_backend = UsersAuthenticationBackend()
 
 
 class ThrottledAPIMixin(object):
-    throttle_scope = 'others'
+    throttle_scope = "others"
 
 
 class BatchView(ThrottledAPIMixin, CreateAPIView):
@@ -106,16 +109,16 @@ class BatchView(ThrottledAPIMixin, CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         if serializer.is_valid():
             valid_data = serializer.validated_data.copy()
-            num_of_users = valid_data.pop('number_of_users', None)
-            valid_data['organization'] = valid_data.pop('organization_slug', None)
+            num_of_users = valid_data.pop("number_of_users", None)
+            valid_data["organization"] = valid_data.pop("organization_slug", None)
             batch = serializer.create(valid_data)
-            strategy = valid_data.get('strategy')
-            if strategy == 'csv':
+            strategy = valid_data.get("strategy")
+            if strategy == "csv":
                 batch.csvfile_upload()
-                response = RadiusBatchSerializer(batch, context={'request': request})
+                response = RadiusBatchSerializer(batch, context={"request": request})
             else:
-                batch.prefix_add(valid_data.get('prefix'), num_of_users)
-                response = RadiusBatchSerializer(batch, context={'request': request})
+                batch.prefix_add(valid_data.get("prefix"), num_of_users)
+                response = RadiusBatchSerializer(batch, context={"request": request})
             return Response(response.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -127,19 +130,19 @@ class DispatchOrgMixin(object):
     def dispatch(self, *args, **kwargs):
         try:
             self.organization = Organization.objects.select_related(
-                'radius_settings'
-            ).get(slug=kwargs['slug'])
+                "radius_settings"
+            ).get(slug=kwargs["slug"])
         except Organization.DoesNotExist:
-            raise Http404('No Organization matches the given query.')
+            raise Http404("No Organization matches the given query.")
         return super().dispatch(*args, **kwargs)
 
     def validate_membership(self, user):
         if not (user.is_superuser or user.is_member(self.organization)):
             message = _(
-                'The user {username} is not member of organization {organization}.'
+                "The user {username} is not member of organization {organization}."
             ).format(username=user.username, organization=self.organization.name)
             logger.info(message)
-            raise serializers.ValidationError({'non_field_errors': [message]})
+            raise serializers.ValidationError({"non_field_errors": [message]})
 
 
 class DownloadRadiusBatchPdfView(ThrottledAPIMixin, DispatchOrgMixin, RetrieveAPIView):
@@ -147,19 +150,19 @@ class DownloadRadiusBatchPdfView(ThrottledAPIMixin, DispatchOrgMixin, RetrieveAP
     permission_classes = (IsOrganizationManager, IsAdminUser, DjangoModelPermissions)
     queryset = RadiusBatch.objects.all()
 
-    @swagger_auto_schema(responses={200: '(File Byte Stream)'})
+    @swagger_auto_schema(responses={200: "(File Byte Stream)"})
     def get(self, request, *args, **kwargs):
         radbatch = self.get_object()
-        if radbatch.strategy == 'prefix':
+        if radbatch.strategy == "prefix":
             pdf = generate_pdf(radbatch.pk)
-            response = HttpResponse(content_type='application/pdf')
-            response[
-                'Content-Disposition'
-            ] = f'attachment; filename="{radbatch.name}.pdf"'
+            response = HttpResponse(content_type="application/pdf")
+            response["Content-Disposition"] = (
+                f'attachment; filename="{radbatch.name}.pdf"'
+            )
             response.write(pdf)
             return response
         else:
-            message = _('Only available for users created with prefix strategy')
+            message = _("Only available for users created with prefix strategy")
             raise NotFound(message)
 
 
@@ -169,10 +172,10 @@ download_rad_batch_pdf = DownloadRadiusBatchPdfView.as_view()
 class UserDetailsUpdaterMixin(object):
     def update_user_details(self, user):
         language = get_language_from_request(self.request)
-        update_fields = ['last_login']
+        update_fields = ["last_login"]
         if user.language != language:
             user.language = language
-            update_fields.append('language')
+            update_fields.append("language")
         user.last_login = timezone.now()
         user.save(update_fields=update_fields)
 
@@ -187,14 +190,14 @@ class RadiusTokenMixin(object):
             RadiusAccounting.objects.filter(
                 username=user, organization=organization, stop_time=None
             )
-            .order_by('start_time')
+            .order_by("start_time")
             .last()
         )
         # nothing to update
         if not radacct:
             return
         # an open session found, flag it as terminated
-        radacct.terminate_cause = 'NAS_Request'
+        radacct.terminate_cause = "NAS_Request"
         time = timezone.now()
         radacct.update_time = time
         radacct.stop_time = time
@@ -233,15 +236,15 @@ class RadiusTokenMixin(object):
         # Create a cache for 24 hours so that next
         # user request is responded quickly.
         if enable_auth:
-            cache.set(f'rt-{user.username}', str(organization.pk), 86400)
+            cache.set(f"rt-{user.username}", str(organization.pk), 86400)
         return radius_token
 
 
 @method_decorator(
-    name='post',
+    name="post",
     decorator=swagger_auto_schema(
         operation_description=(
-            'Used by users to create new accounts, usually to access the internet.'
+            "Used by users to create new accounts, usually to access the internet."
         ),
         responses={201: RegisterResponse},
     ),
@@ -257,7 +260,7 @@ class RegisterView(
         radius_token = self.get_or_create_radius_token(
             user, self.organization, enable_auth=False
         )
-        data['radius_user_token'] = radius_token.key
+        data["radius_user_token"] = radius_token.key
         return data
 
 
@@ -271,7 +274,7 @@ class ObtainAuthTokenView(
     IDVerificationHelper,
     UserDetailsUpdaterMixin,
 ):
-    throttle_scope = 'obtain_auth_token'
+    throttle_scope = "obtain_auth_token"
     serializer_class = rest_auth_settings.api_settings.TOKEN_SERIALIZER
     auth_serializer_class = AuthTokenSerializer
     authentication_classes = [SesameAuthentication]
@@ -290,34 +293,34 @@ class ObtainAuthTokenView(
         user = request.user
         if user.is_anonymous:
             serializer = self.auth_serializer_class(
-                data=request.data, context={'request': request}
+                data=request.data, context={"request": request}
             )
             serializer.is_valid(raise_exception=True)
             user = self.get_user(serializer, *args, **kwargs)
         token, _ = UserToken.objects.get_or_create(user=user)
         self.get_or_create_radius_token(user, self.organization, renew=renew_required)
         self.update_user_details(user)
-        context = {'view': self, 'request': request}
+        context = {"view": self, "request": request}
         serializer = self.serializer_class(instance=token, context=context)
         response = RadiusUserSerializer(user).data
         response.update(serializer.data)
         status_code = 200 if user.is_active else 401
         # If identity verification is required, check if user is verified
         if self._needs_identity_verification(
-            {'slug': kwargs['slug']}
+            {"slug": kwargs["slug"]}
         ) and not self.is_identity_verified_strong(user):
             status_code = 401
         return Response(response, status=status_code)
 
     def get_user(self, serializer, *args, **kwargs):
-        user = serializer.validated_data['user']
+        user = serializer.validated_data["user"]
         self.validate_membership(user)
         return user
 
     def validate_membership(self, user):
         if not (user.is_superuser or user.is_member(self.organization)):
             if get_organization_radius_settings(
-                self.organization, 'registration_enabled'
+                self.organization, "registration_enabled"
             ):
                 if self._needs_identity_verification(
                     org=self.organization
@@ -331,12 +334,12 @@ class ObtainAuthTokenView(
                     org_user.save()
                 except ValidationError as error:
                     raise serializers.ValidationError(
-                        {'non_field_errors': error.message_dict.pop('__all__')}
+                        {"non_field_errors": error.message_dict.pop("__all__")}
                     )
             else:
                 message = _(
-                    '{organization} does not allow self registration '
-                    'of new accounts.'
+                    "{organization} does not allow self registration "
+                    "of new accounts."
                 ).format(organization=self.organization.name)
                 raise PermissionDenied(message)
 
@@ -355,7 +358,7 @@ class ValidateAuthTokenView(
     IDVerificationHelper,
     UserDetailsUpdaterMixin,
 ):
-    throttle_scope = 'validate_auth_token'
+    throttle_scope = "validate_auth_token"
     serializer_class = ValidateTokenSerializer
 
     @swagger_auto_schema(request_body=ValidateTokenSerializer)
@@ -363,12 +366,12 @@ class ValidateAuthTokenView(
         """
         Used to check whether the auth token of a user is valid or not.
         """
-        request_token = request.data.get('token')
-        response = {'response_code': 'BLANK_OR_INVALID_TOKEN'}
+        request_token = request.data.get("token")
+        response = {"response_code": "BLANK_OR_INVALID_TOKEN"}
         if request_token:
             try:
                 token = UserToken.objects.select_related(
-                    'user', 'user__registered_user'
+                    "user", "user__registered_user"
                 ).get(key=request_token)
             except UserToken.DoesNotExist:
                 pass
@@ -382,19 +385,19 @@ class ValidateAuthTokenView(
                 if not self.is_identity_verified_strong(user):
                     phone_token = (
                         PhoneToken.objects.filter(user=user)
-                        .order_by('-created')
+                        .order_by("-created")
                         .first()
                     )
                     user.phone_number = (
                         phone_token.phone_number if phone_token else user.phone_number
                     )
                 response = RadiusUserSerializer(user).data
-                context = {'view': self, 'request': request}
+                context = {"view": self, "request": request}
                 token_data = rest_auth_settings.api_settings.TOKEN_SERIALIZER(
                     token, context=context
                 ).data
-                token_data['auth_token'] = token_data.pop('key')
-                token_data['response_code'] = 'AUTH_TOKEN_VALIDATION_SUCCESSFUL'
+                token_data["auth_token"] = token_data.pop("key")
+                token_data["response_code"] = "AUTH_TOKEN_VALIDATION_SUCCESSFUL"
                 response.update(token_data)
                 self.update_user_details(token.user)
                 return Response(response, 200)
@@ -407,12 +410,12 @@ validate_auth_token = ValidateAuthTokenView.as_view()
 class UserAccountingFilter(AccountingFilter):
     class Meta(AccountingFilter.Meta):
         fields = [
-            field for field in AccountingFilter.Meta.fields if field != 'username'
+            field for field in AccountingFilter.Meta.fields if field != "username"
         ]
 
 
 @method_decorator(
-    name='get',
+    name="get",
     decorator=swagger_auto_schema(
         operation_description="""
         **Requires the user auth token (Bearer Token).**
@@ -428,14 +431,14 @@ class UserAccountingView(ThrottledAPIMixin, DispatchOrgMixin, ListAPIView):
     pagination_class = AccountingViewPagination
     filter_backends = (DjangoFilterBackend,)
     filterset_class = UserAccountingFilter
-    queryset = RadiusAccounting.objects.all().order_by('-start_time')
+    queryset = RadiusAccounting.objects.all().order_by("-start_time")
 
     def list(self, request, *args, **kwargs):
         self.request = request
         return super().list(request, *args, **kwargs)
 
     def get_queryset(self):
-        if getattr(self, 'swagger_fake_view', False):
+        if getattr(self, "swagger_fake_view", False):
             return super().get_queryset()  # pragma: no cover
         return (
             super()
@@ -448,7 +451,7 @@ user_accounting = UserAccountingView.as_view()
 
 
 @method_decorator(
-    name='get',
+    name="get",
     decorator=swagger_auto_schema(
         operation_description="""
         **Requires the user auth token (Bearer Token).**
@@ -523,7 +526,7 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
         password_reset_urls = app_settings.PASSWORD_RESET_URLS
         password_reset_url = app_settings.DEFAULT_PASSWORD_RESET_URL
         domain = get_current_site(self.request).domain
-        if getattr(self, 'swagger_fake_view', False):
+        if getattr(self, "swagger_fake_view", False):
             organization_pk, organization_slug = None, None  # pragma: no cover
         else:
             organization_pk = self.organization.pk
@@ -538,18 +541,18 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
         password_reset_url = password_reset_url.format(
             organization=organization_slug, uid=uid, token=token, site=domain
         )
-        context = {'request': self.request, 'password_reset_url': password_reset_url}
+        context = {"request": self.request, "password_reset_url": password_reset_url}
         return context
 
     def get_user(self, request):
-        if request.data.get('input', None):
-            input = request.data['input']
+        if request.data.get("input", None):
+            input = request.data["input"]
             user = auth_backend.get_users(input).first()
             if user is None:
-                raise Http404('No user was found with given details.')
+                raise Http404("No user was found with given details.")
             self.validate_membership(user)
             return user
-        raise ParseError(_('The email field is required.'))
+        raise ParseError(_("The email field is required."))
 
 
 password_reset = PasswordResetView.as_view()
@@ -574,9 +577,9 @@ class PasswordResetConfirmView(
         return super().post(request, *args, **kwargs)
 
     def validate_user(self, *args, **kwargs):
-        if self.request.POST.get('uid', None):
+        if self.request.POST.get("uid", None):
             try:
-                uid = url_str_to_user_pk(self.request.POST['uid'])
+                uid = url_str_to_user_pk(self.request.POST["uid"])
                 user = User.objects.get(pk=uid)
             except (User.DoesNotExist, ValidationError):
                 raise Http404()
@@ -590,7 +593,7 @@ password_reset_confirm = PasswordResetConfirmView.as_view()
 class CreatePhoneTokenView(
     ErrorDictMixin, BaseThrottle, DispatchOrgMixin, CreateAPIView
 ):
-    throttle_scope = 'create_phone_token'
+    throttle_scope = "create_phone_token"
     authentication_classes = (BearerAuthentication,)
     permission_classes = (
         IsSmsVerificationEnabled,
@@ -606,7 +609,7 @@ class CreatePhoneTokenView(
             """
         ),
         request_body=no_body,
-        responses={201: ''},
+        responses={201: ""},
     )
     def post(self, request, *args, **kwargs):
         # Required for drf-yasg
@@ -615,7 +618,7 @@ class CreatePhoneTokenView(
     def create(self, *args, **kwargs):
         request = self.request
         self.validate_membership(request.user)
-        phone_number = request.data.get('phone_number', request.user.phone_number)
+        phone_number = request.data.get("phone_number", request.user.phone_number)
         phone_token = PhoneToken(
             user=request.user,
             ip=self.get_ident(request),
@@ -623,23 +626,23 @@ class CreatePhoneTokenView(
         )
         try:
             phone_token.full_clean()
-            if kwargs.get('enforce_unverified', True):
+            if kwargs.get("enforce_unverified", True):
                 phone_token._validate_already_verified()
         except ValidationError as e:
             error_dict = self._get_error_dict(e)
             raise serializers.ValidationError(error_dict)
         except UserAlreadyVerified as e:
-            raise serializers.ValidationError({'user': str(e)})
-        org_cooldown = self.organization.radius_settings.get_setting('sms_cooldown')
+            raise serializers.ValidationError({"user": str(e)})
+        org_cooldown = self.organization.radius_settings.get_setting("sms_cooldown")
         try:
             self.enforce_sms_request_cooldown(org_cooldown, phone_number)
         except SmsAttemptCooldownException as e:
             return Response(
-                {'non_field_errors': [str(e)], 'cooldown': e.cooldown}, status=400
+                {"non_field_errors": [str(e)], "cooldown": e.cooldown}, status=400
             )
         phone_token.save()
         return Response(
-            {'cooldown': org_cooldown},
+            {"cooldown": org_cooldown},
             status=201,
         )
 
@@ -652,7 +655,7 @@ class CreatePhoneTokenView(
                 phone_number=phone_number,
                 created__gt=datetime_now - timezone.timedelta(seconds=cooldown),
             )
-            .only('created')
+            .only("created")
             .first()
         )
         if last_phone_token:
@@ -660,7 +663,7 @@ class CreatePhoneTokenView(
                 (datetime_now - last_phone_token.created).total_seconds()
             )
             raise SmsAttemptCooldownException(
-                _('Wait before requesting another SMS token.'),
+                _("Wait before requesting another SMS token."),
                 cooldown=remaining_cooldown,
             )
 
@@ -669,7 +672,7 @@ create_phone_token = CreatePhoneTokenView.as_view()
 
 
 class GetPhoneTokenStatusView(DispatchOrgMixin, GenericAPIView):
-    throttle_scope = 'phone_token_status'
+    throttle_scope = "phone_token_status"
     authentication_classes = (BearerAuthentication,)
     permission_classes = (
         IsSmsVerificationEnabled,
@@ -698,7 +701,7 @@ class GetPhoneTokenStatusView(DispatchOrgMixin, GenericAPIView):
             verified=False,
         ).exists()
         return Response(
-            data={'active': is_active},
+            data={"active": is_active},
             status=200,
         )
 
@@ -707,7 +710,7 @@ get_phone_token_status = GetPhoneTokenStatusView.as_view()
 
 
 class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
-    throttle_scope = 'validate_phone_token'
+    throttle_scope = "validate_phone_token"
     authentication_classes = (BearerAuthentication,)
     permission_classes = (
         IsSmsVerificationEnabled,
@@ -715,10 +718,10 @@ class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
     )
     serializer_class = ValidatePhoneTokenSerializer
 
-    def _error_response(self, message, key='non_field_errors', status=400):
+    def _error_response(self, message, key="non_field_errors", status=400):
         return Response({key: [message]}, status=status)
 
-    @swagger_auto_schema(responses={201: ''})
+    @swagger_auto_schema(responses={201: ""})
     def post(self, request, *args, **kwargs):
         """
         **Requires the user auth token (Bearer Token).**
@@ -729,20 +732,20 @@ class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
         self.validate_membership(user)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        phone_token = PhoneToken.objects.filter(user=user).order_by('-created').first()
+        phone_token = PhoneToken.objects.filter(user=user).order_by("-created").first()
         if not phone_token:
             return self._error_response(
-                _('No verification code found in the system for this user.')
+                _("No verification code found in the system for this user.")
             )
         try:
-            is_valid = phone_token.is_valid(serializer.data['code'])
+            is_valid = phone_token.is_valid(serializer.data["code"])
         except PhoneTokenException as e:
             return self._error_response(str(e))
         if not is_valid:
-            return self._error_response(_('Invalid code.'))
+            return self._error_response(_("Invalid code."))
         else:
             user.registered_user.is_verified = True
-            user.registered_user.method = 'mobile_phone'
+            user.registered_user.method = "mobile_phone"
             user.is_active = True
             # Update username if phone_number is used as username
             if user.username == user.phone_number:
@@ -753,7 +756,7 @@ class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
             user.save()
             user.registered_user.save()
             # delete any radius token cache key if present
-            cache.delete(f'rt-{phone_token.phone_number}')
+            cache.delete(f"rt-{phone_token.phone_number}")
             return Response(None, status=200)
 
 
@@ -776,7 +779,7 @@ class ChangePhoneNumberView(ThrottledAPIMixin, CreatePhoneTokenView):
             user as inactive and send them a verification code via SMS.
             """
         ),
-        responses={200: ''},
+        responses={200: ""},
     )
     def post(self, request, *args, **kwargs):
         # Required for drf-yasg
@@ -796,8 +799,292 @@ class ChangePhoneNumberView(ThrottledAPIMixin, CreatePhoneTokenView):
         return Response(None, status=200)
 
     def create_phone_token(self, *args, **kwargs):
-        kwargs['enforce_unverified'] = False
+        kwargs["enforce_unverified"] = False
         return super().create(*args, **kwargs)
 
 
 change_phone_number = ChangePhoneNumberView.as_view()
+
+
+def _generate_token(size: int):
+    return "".join(
+        random.choice(string.ascii_letters + string.digits) for _ in range(size)
+    )
+
+
+def _get_imowi_token(s):
+    imowi_clien_access = "imowi_clien_access"  # imowi_clien_access dummy data
+    r = s.post(
+        "https://wsaccess.imowi.com.ar/bssrest/v1/auth/login",
+        data=json.dumps(imowi_clien_access),
+    )
+    if r.status_code == 200:
+        r_json = r.json()
+
+        token = r_json["accessToken"]
+        expires = r_json["expiresIn"]
+
+        now = datetime.datetime.now()
+        expire_datetime = datetime.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%S.%f")
+
+        elapsed = expire_datetime - now
+        valid_seconds = elapsed.total_seconds()
+
+        if valid_seconds > 0:
+            cache.set("imowi_api_token", token, valid_seconds - 60)
+
+            return token
+        else:
+            msg = _("Error on auth expire data call to imowi api")
+            raise serializers.ValidationError(msg, code="authorization")
+    else:
+        msg = _("Error on auth response to imowi api")
+        raise serializers.ValidationError(msg, code="authorization")
+
+
+def _get_imowi_phone_record(session, phone_number):
+    if not token:
+        token = _get_imowi_token(session)
+        headers = {"Authorization": "Bearer {}".format(token)}
+        request = session.get(
+            "https://wsaccess.imowi.com.ar/bssrest/v1/msisdn/{}".format(phone_number),
+            headers=headers,
+        )
+
+        if request.status_code == 401 or request.status_code == 403:
+            token = _get_imowi_token(session)
+            headers = {"Authorization": "Bearer {}".format(token)}
+            request = session.get(
+                "https://wsaccess.imowi.com.ar/bssrest/v1/msisdn/{}".format(
+                    phone_number
+                ),
+                headers=headers,
+            )
+
+        elif request.status_code == 200:
+            phone_json = request.json()
+
+            if phone_json["status"] != "ACTIVE":
+                msg = _(
+                    "Error generating auth access token, this phone number is not active"
+                )
+                raise serializers.ValidationError(msg, code="authorization")
+
+            if phone_json["storeStatus"] != "ASSIGNED":
+                msg = _(
+                    "Error generating auth access token, this phone number is not assigned"
+                )
+                raise serializers.ValidationError(msg, code="authorization")
+            return phone_json
+
+        elif request.status_code == 404:
+            msg = _("Error generating auth access token, number not found on database.")
+            raise serializers.ValidationError(msg, code="authorization")
+        else:
+            msg = _("Error generating auth access token, fail on api call")
+            raise serializers.ValidationError(msg, code="authorization")
+
+
+def _get_imowi_user_data(phone_number):
+    # imowi_clien_access dummy data
+    Pkcs12Adapter = None
+    imowi_client_certificate = None
+    imowi_client_certificate_pass = None
+    with requests.Session() as session:
+        session.mount(
+            "https://wsaccess.imowi.com.ar",
+            Pkcs12Adapter(
+                pkcs12_data=base64.b64decode(imowi_client_certificate),
+                pkcs12_password=base64.b64decode(imowi_client_certificate_pass),
+            ),
+        )
+
+    token = cache.get("imowi_api_token")
+    phone_record = _get_imowi_phone_record(session, phone_number)
+    headers = {"Authorization": "Bearer {}".format(token)}
+    request = session.get(
+        "https://wsaccess.imowi.com.ar/bssrest/v1/subscription/{}".format(
+            phone_record["subscription"]["id"]
+        ),
+        headers=headers,
+    )
+
+    if request.status_code == 200:
+        user = User.objects.get(username=phone_number)
+
+        suscription_json = request.json()
+        plan = suscription_json["name"]
+        username = suscription_json["subscriber"]["name"]
+
+        name_split = username.split(" ")
+        firstname = name_split[0]
+        lastname = ""
+
+        if len(name_split) > 3:
+            firstname = str.join(" ", name_split[0:2])
+            lastname = str.join(" ", name_split[2:])
+        else:
+            lastname = str.join(" ", name_split[1:])
+        return {
+            "phone_number": phone_number,
+            "username": username,
+            "plan": "",
+            "firstname": firstname,
+            "lastname": lastname,
+            # "email": phone_number + "@imowi.com",
+        }
+
+    else:
+        msg = _("Error generating auth access token, fail on get the suscription data")
+        raise serializers.ValidationError(msg, code="authorization")
+
+
+def _get_user_data(phone_number):
+    try:
+        user = _get_imowi_user_data(phone_number)
+    except:
+        user = {
+            "phone_number": phone_number,
+            "username": phone_number,
+            "plan": "",
+            "firstname": "",
+            "lastname": "",
+            # "email": phone_number + "@no_email.com",
+        }
+    return user
+
+
+def _enforce_sms_request_cooldown(user, cooldown, phone_number):
+    # enforce SMS_COOLDOWN
+    datetime_now = timezone.now()
+    last_phone_token = (
+        PhoneToken.objects.filter(
+            user=user,
+            phone_number=phone_number,
+            created__gt=datetime_now - timezone.timedelta(seconds=cooldown),
+        )
+        .only("created")
+        .first()
+    )
+    if last_phone_token:
+        remaining_cooldown = cooldown - round(
+            (datetime_now - last_phone_token.created).total_seconds()
+        )
+        raise SmsAttemptCooldownException(
+            _("Wait before requesting another SMS token."),
+            cooldown=remaining_cooldown,
+        )
+
+
+class GetPhoneOTPView(
+    DispatchOrgMixin, ErrorDictMixin, BaseThrottle, RadiusTokenMixin, GenericAPIView
+):
+    serializer_class = serializers.Serializer
+    throttle_scope = "create_phone_token"
+
+    @method_decorator(csrf_exempt)
+    def dispatch(self, request, *args, **kwargs):
+        return super(GetPhoneOTPView, self).dispatch(request, *args, **kwargs)
+
+    @swagger_auto_schema(
+        request_body=ObtainTokenResponse, responses={200: ObtainTokenResponse}
+    )
+    def post(self, request, *args, **kwargs):
+        """
+        Obtain the user radius token required for authentication in APIs.
+        """
+
+        def _create_otp(user, phone_number):
+            request = self.request
+
+            phone_token = PhoneToken(
+                user=user,
+                ip=self.get_ident(request),
+                phone_number=phone_number,
+            )
+            try:
+                phone_token.full_clean()
+            except ValidationError as e:
+                error_dict = self._get_error_dict(e)
+                raise serializers.ValidationError(error_dict)
+            org_cooldown = self.organization.radius_settings.get_setting("sms_cooldown")
+            try:
+                _enforce_sms_request_cooldown(user, org_cooldown, phone_number)
+            except SmsAttemptCooldownException as e:
+                return Response(
+                    {"non_field_errors": [str(e)], "cooldown": e.cooldown}, status=400
+                )
+            phone_token.save()
+            return org_cooldown
+
+        phone_number = request.data.get("phone_number")
+
+        if not phone_number:
+            msg = _('Must include "phone number".')
+            return Response({"msg": msg}, status=400)
+        try:
+            user = User.objects.get(phone_number=phone_number)
+            print("User exists")
+        except User.DoesNotExist:
+            print("User not exists then create a new one")
+            new_user = _get_user_data(phone_number)
+            print("Trying to create a new user")
+
+            if not new_user:
+                print("Trying to create a new user has failed")
+
+                msg = _('"username" not exists.')
+                return Response({"msg": msg}, status=401)
+
+            user = User.objects.create(
+                username=new_user["username"],
+                first_name=new_user["firstname"],
+                last_name=new_user["lastname"],
+                phone_number=new_user["phone_number"],
+            )
+            user.set_password(_generate_token(64))
+            user.save()
+
+            try:
+                org_user = OrganizationUser(user=user, organization=self.organization)
+                org_user.full_clean()
+                org_user.save()
+                print("New user added to the organization")
+            except ValidationError as error:
+                raise serializers.ValidationError(
+                    {"non_field_errors": error.message_dict.pop("__all__")}
+                )
+
+            print("New user created satisfactorially")
+
+        try:
+            print("Caching the user password - 1")
+
+            token = _generate_token(6)
+            print("Caching the user password - 2")
+
+            while cache.get("radius_auth_token_{}".format(token)) is not None:
+                print("Caching the user password - 3")
+
+                token = _generate_token(6)
+                print("Caching the user password - 4")
+
+            print("Caching the user password - 5")
+
+            cache.set("radius_auth_token_{}".format(token), token, 600)
+            print("Caching the user password - 6")
+
+        except:
+            print("Error caching the user password")
+            msg = _("Error generating auth access token.")
+            return Response({"msg": msg}, status=500)
+
+        print("Trying to get a cooldown for the otp")
+        cooldown = _create_otp(user, phone_number)
+
+
+
+        return Response({"cooldown": cooldown}, status=201)
+
+
+get_phone_otp = GetPhoneOTPView.as_view()

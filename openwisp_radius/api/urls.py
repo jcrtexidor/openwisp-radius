@@ -83,6 +83,11 @@ def get_api_urls(api_views=None):
                 api_views.download_rad_batch_pdf,
                 name='download_rad_batch_pdf',
             ),
+            path(
+                'radius/organization/<slug:slug>/account/phone_login/otp/',
+                api_views.get_phone_otp,
+                name='get_phone_otp',
+            ),
         ]
     else:
         return []
