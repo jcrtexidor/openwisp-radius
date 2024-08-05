@@ -88,6 +88,11 @@ def get_api_urls(api_views=None):
                 api_views.get_phone_otp,
                 name='get_phone_otp',
             ),
+            path(
+                'radius/organization/<slug:slug>/account/phone_login/token/',
+                api_views.get_phone_token,
+                name='get_phone_otp',
+            ),
         ]
     else:
         return []

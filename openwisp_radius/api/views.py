@@ -64,10 +64,21 @@ from .serializers import (
     UserRadiusUsageSerializer,
     ValidatePhoneTokenSerializer,
 )
-from .swagger import ObtainTokenRequest, ObtainTokenResponse, RegisterResponse
+from .swagger import (
+    ObtainTokenRequest,
+    ObtainPhoneTokenRequest,
+    ObtainTokenResponse,
+    RegisterResponse,
+)
 from .utils import ErrorDictMixin, IDVerificationHelper
 
-import datetime, requests, json, random, string, base64, twilio
+import datetime
+import requests
+import json
+import random
+import string
+import base64
+import twilio
 
 authorize = freeradius_views.authorize
 postauth = freeradius_views.postauth
@@ -78,6 +89,7 @@ renew_required = app_settings.DISPOSABLE_RADIUS_USER_TOKEN
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
+RegisteredUser = load_model('RegisteredUser')
 Organization = swapper.load_model("openwisp_users", "Organization")
 OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
 PhoneToken = load_model("PhoneToken")
@@ -1082,9 +1094,154 @@ class GetPhoneOTPView(
         print("Trying to get a cooldown for the otp")
         cooldown = _create_otp(user, phone_number)
 
-
-
         return Response({"cooldown": cooldown}, status=201)
 
 
 get_phone_otp = GetPhoneOTPView.as_view()
+
+
+class GetPhoneTokenView(
+    DispatchOrgMixin,
+    RadiusTokenMixin,
+    BaseObtainAuthToken,
+    IDVerificationHelper,
+    UserDetailsUpdaterMixin,
+):
+    throttle_scope = "validate_phone_token"
+    authentication_classes = [SesameAuthentication]
+    # permission_classes = (IsSmsVerificationEnabled)
+    serializer_class = ValidatePhoneTokenSerializer
+    auth_serializer_class = AuthTokenSerializer
+
+    # THIS SERIALIZER IS FOR AUTHENTICATION
+    token_serializer_class = rest_auth_settings.api_settings.TOKEN_SERIALIZER
+
+    def _error_response(self, message, key="non_field_errors", status=400):
+        return Response({key: [message]}, status=status)
+
+    @method_decorator(csrf_exempt)
+    def dispatch(self, request, *args, **kwargs):
+        return super(GetPhoneTokenView, self).dispatch(request, *args, **kwargs)
+
+    @swagger_auto_schema(request_body=ObtainPhoneTokenRequest, responses={200: ObtainTokenResponse})
+    def post(self, request, *args, **kwargs):
+        """
+        Used for SMS verification, allows users to validate the
+        code they receive via SMS and obtain the user radius token
+        required for authentication in APIs.
+        """
+        try:
+            user = User.objects.get(phone_number=request.data.get("phone_number"))
+            print('The user was found')
+            self.validate_membership(user)
+            print('The user was validated')
+            serializer = self.get_serializer(data=request.data)
+            print('Getting the serializer') 
+            serializer.is_valid(raise_exception=True)
+            print('The serializer is valid')  
+            phone_token = PhoneToken.objects.filter(user=user).order_by("-created").first()
+            print('Searching for the phone token')  
+            if not phone_token:
+                print('The phone token was not found')
+                return self._error_response(_("No verification code found in the system for this user."))
+            try:
+                print('Checking if the OTP is valid')
+                is_valid = phone_token.is_valid(serializer.data["code"])
+            except UserAlreadyVerified as e:
+                print('The user is already verified')
+                is_valid = True
+            except PhoneTokenException as e:
+                print('Error checking the OTP')
+                return self._error_response(str(e))
+            if not is_valid:
+                print('The OTP is not valid')
+                return self._error_response(_("Invalid code."))
+            else:
+                print('Updating user data: is_verified, method, is_active, username')
+                try: 
+                    registered_user=RegisteredUser.objects.get(user=user)
+                except RegisteredUser.DoesNotExist:
+                    registered_user=RegisteredUser.objects.create(
+                        user=user,
+                        is_verified=True,
+                        method="mobile_phone",
+                    )
+                    registered_user.save()
+
+                user.is_active = True
+                # Update username if not set
+                if not user.username:
+                    user.username = phone_token.phone_number
+                # now that the phone number is verified
+                # we can write it to the user field
+                user.save()
+                # delete any radius token cache key if present
+                cache.delete(f"rt-{phone_token.phone_number}")
+                print('User was updated')
+
+            def get_user(self, serializer, *args, **kwargs):
+                print('Getting user')
+                user = serializer.validated_data["user"]
+                print('User was getted, then validate membership')
+                validate_membership(user)
+                print('Membership validated')
+                return user
+
+            def validate_membership(self, user):
+                if not (user.is_superuser or user.is_member(self.organization)):
+                    if get_organization_radius_settings(self.organization, "registration_enabled"):
+                        if self._needs_identity_verification(org=self.organization) and not self.is_identity_verified_strong(user):
+                            print('User have not permission for self registration')
+                            raise PermissionDenied
+                        try:
+                            print('Registering the user in the organization')
+                            org_user = OrganizationUser(user=user, organization=self.organization)
+                            org_user.full_clean()
+                            org_user.save()
+                            print('The user was registered in the organization')
+                        except ValidationError as error:
+                            print('Raising a validation error')
+                            raise serializers.ValidationError(
+                                {"non_field_errors": error.message_dict.pop("__all__")})
+                    else:
+                        message = _(
+                            "{organization} does not allow self registration "
+                            "of new accounts."
+                        ).format(organization=self.organization.name)
+                        raise PermissionDenied(message)
+
+            if user.is_anonymous:
+                print('The user is anonimous')
+                serializer = self.auth_serializer_class(data=request.data, context={"request": request})  # TODO: Instead of request.data, use username and password because request.data just containd phone number and code
+                print('Validate the user')
+                # TODO: serializer.is_valid is who make the loging
+                serializer.is_valid(raise_exception=True)
+                print('The user was validated')
+                user = get_user(serializer, *args, **kwargs)
+                print('The user was founded')
+            token, NOT_USED_VARIABLE = UserToken.objects.get_or_create(user=user)
+            print('User token was created')
+            self.get_or_create_radius_token(user, self.organization, renew=renew_required)
+            print('Radious token was created')
+            self.update_user_details(user)
+            print('User was updated')
+            context = {"view": self, "request": None}
+            print('Cheking the user token')
+            token_serializer = self.token_serializer_class(instance=token, context=context)
+            print('Preparing response')
+            response = RadiusUserSerializer(user).data
+            print('Response created')
+            response.update(token_serializer.data)
+            print('Response updated')
+            status_code = 200 if user.is_active else 401
+            # If identity verification is required, check if user is verified
+            if self._needs_identity_verification({"slug": kwargs["slug"]}) and not self.is_identity_verified_strong(user):
+                print('User needs identity verification')
+                status_code = 401
+                print('Returning an error')
+            return Response(response, status=status_code)
+        except User.DoesNotExist:
+            return Response({"msg": "The phone number is not registered"}, status=401)
+
+
+get_phone_token = GetPhoneTokenView.as_view()
