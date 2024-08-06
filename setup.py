@@ -46,6 +46,7 @@ setup(
         'passlib~=1.7.1',
         'djangorestframework-link-header-pagination~=0.1.1',
         'weasyprint~=59.0',
+        'pydyf~=0.10.0',  # remove this once we upgrade wasyprint
         'dj-rest-auth~=4.0.1',
         'django-sendsms~=0.5.0',
         'jsonfield~=3.1.0',
@@ -58,7 +59,7 @@ setup(
         'openvpn_status': ['openvpn-status~=0.2.1'],
     },
     classifiers=[
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 5 - Production/Stable ',
         'Environment :: Web Environment',
         'Topic :: Internet :: WWW/HTTP',
         'Topic :: System :: Networking',
