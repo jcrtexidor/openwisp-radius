@@ -11,6 +11,18 @@ class ObtainTokenBase(serializers.Serializer):
     class Meta:
         ref_name = 'OpenwispRadiusObtainToken'
 
+class ObtainPhoneTokenRequest(ObtainTokenBase):
+    phone_number = serializers.CharField(
+        max_length=150,
+        write_only=True,
+        help_text=('Phone number of the user for obtaining tokens.'),
+    )
+    code = serializers.CharField(
+        max_length=128,
+        write_only=True,
+        help_text=('OTP code send to the user for obtaining tokens.'),
+    )
+
 
 class ObtainTokenRequest(ObtainTokenBase):
     username = serializers.CharField(
